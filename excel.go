@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/xuri/excelize/v2"
 )
@@ -119,15 +118,58 @@ func AutoSize(excelFile string, sheetName string) (err error) {
 		return fmt.Errorf("no columns detected in sheet %q: nothing to auto-size", sheetName)
 	}
 
-	// Approximate Excel auto-fit:
-	// - use the longest visual line width (runes) per cell
+	// Excel auto-fit approximation:
+	// - compute visual width using heuristic per-rune weights (wide/narrow chars)
+	// - consider longest visual line for multi-line cells
+	// - ignore trailing spaces like Excel's auto-fit
 	// - add padding to avoid clipping and accommodate filter dropdown on header
 	const (
-		minWidth       = 8.0   // a reasonable minimum
-		maxWidth       = 255.0 // Excel's effective max column width in characters
-		contentPadding = 2.0   // general padding for readability
-		filterPadding  = 2.0   // extra space to account for filter icon on header
+		minWidth         = 8.0   // a reasonable minimum
+		maxWidth         = 255.0 // Excel's effective max column width in characters
+		contentPadding   = 2.0   // general padding for readability
+		filterPadding    = 2.0   // extra space to account for filter icon on header
+		headerBoldFactor = 1.08  // conservative multiplier: bold text tends to render wider
 	)
+
+	// local helper to estimate visual width of a string in default Excel font
+	visualWidth := func(s string) float64 {
+		var w float64
+		for _, r := range s {
+			switch {
+			case r == '\t':
+				w += 4 // treat tab as a few spaces
+			case r <= 0x007F: // basic Latin
+				// Narrow punctuation and glyphs
+				switch r {
+				case ' ', '\'', '`', '.', ',', ':', ';', '!', '|':
+					w += 0.5
+				case 'i', 'l':
+					w += 0.6
+				case 'I':
+					w += 0.7
+				case '1':
+					w += 0.8
+				case '0', '2', '3', '4', '5', '6', '7', '8', '9':
+					w += 0.9
+				case 'W', 'M':
+					w += 1.3
+				default:
+					w += 1.0
+				}
+			case (r >= 0x1100 && r <= 0x11FF) || // Hangul Jamo
+				(r >= 0x2E80 && r <= 0x9FFF) || // CJK Radicals + Unified Ideographs
+				(r >= 0xAC00 && r <= 0xD7AF) || // Hangul Syllables
+				(r >= 0xF900 && r <= 0xFAFF) || // CJK Compatibility Ideographs
+				(r >= 0xFE10 && r <= 0xFE6F) || // Vertical forms etc.
+				(r >= 0xFF00 && r <= 0xFF60) || // Fullwidth forms
+				(r >= 0x1F300 && r <= 0x1FAFF): // Emoji and symbols
+				w += 2.0 // wide glyphs
+			default:
+				w += 1.4 // other non-ASCII assumed slightly wider
+			}
+		}
+		return w
+	}
 
 	for colIdx := 1; colIdx <= maxCols; colIdx++ {
 		var maxVisual float64
@@ -135,18 +177,20 @@ func AutoSize(excelFile string, sheetName string) (err error) {
 			if colIdx-1 < len(r) {
 				cell := r[colIdx-1]
 
-				// Consider multi-line cells: pick the longest line
+				// Consider multi-line cells: pick the longest visual line
 				var cellMax float64
-				for _, line := range strings.Split(cell, "\n") {
-					// Count runes as proxy for width; this is a simple, robust approximation
-					w := float64(utf8.RuneCountInString(line))
-					if w > cellMax {
-						cellMax = w
+				for _, rawLine := range strings.Split(cell, "\n") {
+					// Excel's auto-fit ignores trailing spaces when measuring
+					line := strings.TrimRight(rawLine, " \t")
+					vw := visualWidth(line)
+					if vw > cellMax {
+						cellMax = vw
 					}
 				}
 
-				// Add additional padding on header to prevent filter icon overlapping text
+				// Header tweaks: bold text typically renders wider and filter icon needs room
 				if rIdx == 0 && strings.TrimSpace(cell) != "" {
+					cellMax *= headerBoldFactor
 					cellMax += filterPadding
 				}
 
@@ -278,8 +322,8 @@ func CSVToExcel(csvFile, excelFile, sheetName string, sep rune) (err error) {
 		return fmt.Errorf("unsupported separator %q: only ',' or ';' are allowed", string(sep))
 	}
 	// Validate sheet name
-	if strings.TrimSpace(sheetName) == "" {
-		return errors.New("sheet name must not be empty")
+	if err := validateSheetName(sheetName); err != nil {
+		return err
 	}
 	// Validate source CSV
 	if strings.TrimSpace(csvFile) == "" {
@@ -341,6 +385,10 @@ func CSVToExcel(csvFile, excelFile, sheetName string, sep rune) (err error) {
 			}
 			return fmt.Errorf("read csv: %w", rErr)
 		}
+		// Strip UTF-8 BOM from the first header cell if present
+		if rowIdx == 1 && len(record) > 0 {
+			record[0] = strings.TrimPrefix(record[0], "\uFEFF")
+		}
 		wroteAny = true
 
 		for colIdx, v := range record {
@@ -388,8 +436,8 @@ func validateInputs(excelFile, sheetName string) error {
 	if strings.TrimSpace(excelFile) == "" {
 		return errors.New("excel file path must not be empty")
 	}
-	if strings.TrimSpace(sheetName) == "" {
-		return errors.New("sheet name must not be empty")
+	if err := validateSheetName(sheetName); err != nil {
+		return err
 	}
 	info, err := os.Stat(excelFile)
 	if err != nil {
@@ -442,4 +490,28 @@ func getUsedRangeByHeader(f *excelize.File, sheetName string) (firstCol string, 
 		return "", "", 0, 0, fmt.Errorf("convert column index %d: %w", lastIdx+1, convErr)
 	}
 	return "A", colName, 1, len(rows), nil
+}
+
+// validateSheetName ensures a sheet name conforms to Excel constraints for production safety.
+// Rules: non-empty, max 31 characters, cannot contain: : \ / ? * [ ], and cannot start or end with an apostrophe.
+func validateSheetName(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return errors.New("sheet name must not be empty")
+	}
+	// Excel prohibits leading/trailing apostrophes in sheet names
+	if strings.HasPrefix(trimmed, "'") || strings.HasSuffix(trimmed, "'") {
+		return fmt.Errorf("invalid sheet name %q: leading or trailing apostrophe is not allowed", name)
+	}
+	// Disallowed characters per Excel specification (spaces are allowed)
+	for _, bad := range []rune{':', '\\', '/', '?', '*', '[', ']'} {
+		if strings.ContainsRune(trimmed, bad) {
+			return fmt.Errorf("invalid sheet name %q: contains one of the invalid characters : \\ / ? * [ ]", name)
+		}
+	}
+	// Limit length to 31 characters (counting Unicode code points)
+	if runeCount := len([]rune(trimmed)); runeCount > 31 {
+		return fmt.Errorf("invalid sheet name %q: length %d exceeds Excel limit of 31 characters", name, runeCount)
+	}
+	return nil
 }
